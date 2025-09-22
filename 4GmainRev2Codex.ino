@@ -255,7 +255,7 @@ static void collectAndSendSamples(bool earthquakeTriggered) {
   // pm1, pm2_5, pm4, pm10, voc_index, nox_index,
   // sen55_fan_err, sen55_speed_warn, sen55_laser_err, sen55_rht_err, sen55_gas_err, sen55_cleaning,
   // bme_temp_c_x100, bme_rh_x100, bme_pressure_pa_x100, bme_gas_ohm_x100,
-  // d7s_si_mps, d7s_pga_mps2, d7s_eq_bit,
+  // d7s_eq_bit, d7s_si_mps, d7s_pga_mps2,
   // bat_mV_x100, bat_pct,
   // latitude, longitude
 
@@ -268,7 +268,7 @@ static void collectAndSendSamples(bool earthquakeTriggered) {
     String((sen55_status_b>>0)&1), String((sen55_status_b>>1)&1), String((sen55_status_b>>2)&1),
     String((sen55_status_b>>3)&1), String((sen55_status_b>>4)&1), String((sen55_status_b>>5)&1),
     String(BME680temp), String(BME680humidity), String(BME680pressure), String(BME680gas),
-    String(d7s_si_out, 3), String(d7s_pga_out, 3), String(d7s_eq_out),
+    String(d7s_eq_out), String(d7s_si_out, 3), String(d7s_pga_out, 3),
     String(batV_x100), String(batPct),
     String(latitude), String(longitude)
   );
@@ -283,7 +283,7 @@ static void collectAndSendSamples(bool earthquakeTriggered) {
       String((sen55_status_b>>0)&1), String((sen55_status_b>>1)&1), String((sen55_status_b>>2)&1),
       String((sen55_status_b>>3)&1), String((sen55_status_b>>4)&1), String((sen55_status_b>>5)&1),
       String(BME680temp), String(BME680humidity), String(BME680pressure), String(BME680gas),
-      String(d7s_si_out, 3), String(d7s_pga_out, 3), String(d7s_eq_out),
+      String(d7s_eq_out), String(d7s_si_out, 3), String(d7s_pga_out, 3),
       String(batV_x100), String(batPct),
       String(latitude), String(longitude)
     );
