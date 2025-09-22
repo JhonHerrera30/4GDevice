@@ -43,6 +43,12 @@ static bool     d7s_eq_app         = false;
 static uint32_t d7s_last_change_ms = 0;
 static float    d7s_last_si        = 0.0f;
 static float    d7s_last_pga       = 0.0f;
+static float    d7s_si_out         = 0.0f;
+static float    d7s_pga_out        = 0.0f;
+static int      d7s_eq_out         = 0;
+
+static void collectAndSendSamples(bool earthquakeTriggered);
+static void updateD7SState();
 
 // Flags / buffer tempo
 int flag = 0;
@@ -157,6 +163,175 @@ static void tryStartGNSS() {
 static bool gpsFixValid() { return gps.location.isValid() && gps.location.age() < 5000; }
 static void updateLatLonStrings() {
   if (gpsFixValid()) { latitude = String(gps.location.lat(), 6); longitude = String(gps.location.lng(), 6); }
+}
+
+static void collectAndSendSamples(bool earthquakeTriggered) {
+  Serial.println(earthquakeTriggered
+                   ? F("=== Raccolta dati (trigger terremoto) ===")
+                   : F("=== Raccolta dati (timer) ==="));
+
+  // WiFi & NTP
+  if (WiFi.status() != WL_CONNECTED) { WiFi.begin(); delay(4000); }
+  if (WiFi.status() == WL_CONNECTED && !flag) { timeClient.begin(); flag = 1; }
+
+  // Piccola attesa non bloccante con GNSS feed
+  for (int i = 0; i < 20; ++i) { delay(100); gnssFeed(); }
+  if (!gnssReady || (!gps.satellites.isValid() && !gps.location.isValid())) tryStartGNSS();
+
+  // --- SCD30 ---
+  float co2Concentration = NAN, SCD30temperature = NAN, SCD30humidity = NAN;
+  uint16_t dataReady = 0;
+  if (scd30.getDataReady(dataReady) == 0 && dataReady) {
+    error = scd30.blockingReadMeasurementData(co2Concentration, SCD30temperature, SCD30humidity);
+    if (error != NO_ERROR) { Serial.print("SCD30 read error: "); errorToString(error, errorMessage, sizeof errorMessage); Serial.println(errorMessage); }
+    else {
+      Serial.printf("SCD30 CO2=%.2f ppm (T=%.2fC RH=%.2f%%)\n", co2Concentration, SCD30temperature, SCD30humidity);
+    }
+  } else Serial.println("SCD30 data not ready.");
+
+  // --- SEN55 ---
+  float pm1p0=NAN, pm2p5=NAN, pm4p0=NAN, pm10p0=NAN;
+  float senT=NAN, senRH=NAN, vocIndex=NAN, noxIndex=NAN;
+  for (int i=0;i<15;++i){ delay(80); gnssFeed(); }
+  uint16_t sErr = sen5x.readMeasuredValues(pm1p0, pm2p5, pm4p0, pm10p0, senRH, senT, vocIndex, noxIndex);
+  if (sErr) { Serial.print("SEN55 read err=0x"); Serial.println(sErr, HEX); }
+  else {
+    Serial.printf("SEN55 PM1=%.2f PM2.5=%.2f PM4=%.2f PM10=%.2f VOC=%.2f NOx=%.2f (T=%.2fC RH=%.2f%%)\n",
+                  pm1p0, pm2p5, pm4p0, pm10p0, vocIndex, noxIndex, senT, senRH);
+  }
+  uint32_t sen55_status_word=0; uint8_t sen55_status_b=0;
+  uint16_t sStatErr = sen5x.readDeviceStatus(sen55_status_word);
+  if (!sStatErr) {
+    sen55_status_b = sen55StatusByte(sen55_status_word);
+    Serial.printf("SEN55 status 0x%02X | FAN=%u SPEED=%u LASER=%u RHT=%u GAS=%u CLEAN=%u\n",
+      sen55_status_b,
+      (sen55_status_b>>0)&1, (sen55_status_b>>1)&1, (sen55_status_b>>2)&1,
+      (sen55_status_b>>3)&1, (sen55_status_b>>4)&1, (sen55_status_b>>5)&1);
+  } else { Serial.print("SEN55 status read err=0x"); Serial.println(sStatErr, HEX); }
+
+  // --- BME680 ---
+  static int BME680temp=0, BME680humidity=0, BME680pressure=0, BME680gas=0;
+  if (bme680_ok) {
+    if (!BME680.performReading()) Serial.println("BME680 reading failure.");
+    else {
+      BME680temp     = (int)round(BME680.temperature    * 100.0);
+      BME680humidity = (int)round(BME680.humidity       * 100.0);
+      BME680pressure = (int)round(BME680.pressure       * 100.0);
+      BME680gas      = (int)round(BME680.gas_resistance * 100.0);
+      Serial.printf("BME680 T=%.2fC RH=%.2f%% P=%.2fPa Gas=%.2fΩ\n",
+                    BME680temp/100.0, BME680humidity/100.0, BME680pressure/100.0, BME680gas/100.0);
+    }
+  }
+
+  Serial.printf("D7S SI=%.3f m/s  PGA=%.3f m/s^2  EQ=%d\n", d7s_si_out, d7s_pga_out, d7s_eq_out);
+
+  // --- Batteria ---
+  float vbat = readBatteryVoltage();
+  int batPct = voltageToPercent(vbat);
+  int batV_x100 = (int)lroundf(vbat * 100.0f);
+  Serial.printf("BAT: %.3f V  ~ %d%%\n", vbat, batPct);
+
+  // --- Data/ora ---
+  unsigned long currentEpochTime;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (timeClient.update()) { currentEpochTime = timeClient.getEpochTime(); lastEpochTime = currentEpochTime; lastMillis = millis(); }
+    else                      { currentEpochTime = lastEpochTime + ((millis() - lastMillis) / 1000); }
+  } else {
+    currentEpochTime = lastEpochTime + ((millis() - lastMillis) / 1000);
+  }
+  struct tm *ptm = gmtime((time_t *)&currentEpochTime);
+  sprintf(currentDate, "%4d/%02d/%02d", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday);
+  sprintf(currentTime, "%02d:%02d:%02d", ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+
+  // --- GNSS: aggiorna lat/lon ---
+  updateLatLonStrings();
+
+  String macStr = String(WiFi.macAddress());
+
+  // ========= ORDINAMENTO COLONNE: Sheet == SD =========
+  // data, ora, mac_address,
+  // co2_ppm,
+  // pm1, pm2_5, pm4, pm10, voc_index, nox_index,
+  // sen55_fan_err, sen55_speed_warn, sen55_laser_err, sen55_rht_err, sen55_gas_err, sen55_cleaning,
+  // bme_temp_c_x100, bme_rh_x100, bme_pressure_pa_x100, bme_gas_ohm_x100,
+  // d7s_si_mps, d7s_pga_mps2, d7s_eq_bit,
+  // bat_mV_x100, bat_pct,
+  // latitude, longitude
+
+  // ===== SD =====
+  writeDataOnSD(
+    String(currentDate), String(currentTime), macStr,
+    String(co2Concentration, 2),
+    String(pm1p0), String(pm2p5), String(pm4p0), String(pm10p0),
+    String(vocIndex), String(noxIndex),
+    String((sen55_status_b>>0)&1), String((sen55_status_b>>1)&1), String((sen55_status_b>>2)&1),
+    String((sen55_status_b>>3)&1), String((sen55_status_b>>4)&1), String((sen55_status_b>>5)&1),
+    String(BME680temp), String(BME680humidity), String(BME680pressure), String(BME680gas),
+    String(d7s_si_out, 3), String(d7s_pga_out, 3), String(d7s_eq_out),
+    String(batV_x100), String(batPct),
+    String(latitude), String(longitude)
+  );
+
+  // ===== Google Sheet =====
+  if (WiFi.status() == WL_CONNECTED) {
+    sendDataToGoogle(
+      String(currentDate), String(currentTime), macStr,
+      String(co2Concentration, 2),
+      String(pm1p0), String(pm2p5), String(pm4p0), String(pm10p0),
+      String(vocIndex), String(noxIndex),
+      String((sen55_status_b>>0)&1), String((sen55_status_b>>1)&1), String((sen55_status_b>>2)&1),
+      String((sen55_status_b>>3)&1), String((sen55_status_b>>4)&1), String((sen55_status_b>>5)&1),
+      String(BME680temp), String(BME680humidity), String(BME680pressure), String(BME680gas),
+      String(d7s_si_out, 3), String(d7s_pga_out, 3), String(d7s_eq_out),
+      String(batV_x100), String(batPct),
+      String(latitude), String(longitude)
+    );
+  }
+}
+
+static void updateD7SState() {
+  float d7s_si_raw  = D7S.getInstantaneusSI();    // [m/s]
+  float d7s_pga_raw = D7S.getInstantaneusPGA();   // [m/s^2]
+  bool  d7s_eq_raw  = D7S.isEarthquakeOccuring(); // bit “terremoto” del sensore
+  uint32_t nowMs    = millis();
+
+  bool d7s_changed = (fabsf(d7s_si_raw  - d7s_last_si)  > D7S_EPS_SI) ||
+                     (fabsf(d7s_pga_raw - d7s_last_pga) > D7S_EPS_PGA);
+
+  bool prev_eq_app = d7s_eq_app;
+
+  if (!d7s_eq_app && d7s_eq_raw && d7s_changed) {
+    d7s_eq_app = true;
+    d7s_last_change_ms = nowMs;
+  }
+
+  if (d7s_eq_app) {
+    if (d7s_changed) d7s_last_change_ms = nowMs;
+    if ((nowMs - d7s_last_change_ms) >= D7S_STALE_TIME_MS) {
+      d7s_eq_app = false;
+      D7S.resetEvents();
+    }
+  }
+
+  d7s_last_si  = d7s_si_raw;
+  d7s_last_pga = d7s_pga_raw;
+
+  if (d7s_eq_app) {
+    d7s_si_out  = d7s_si_raw;
+    d7s_pga_out = d7s_pga_raw;
+    d7s_eq_out  = 1;
+  } else {
+    d7s_si_out  = 0.0f;
+    d7s_pga_out = 0.0f;
+    d7s_eq_out  = 0;
+  }
+
+  if (!prev_eq_app && d7s_eq_app) {
+    Serial.println(F("[D7S] Terremoto rilevato: invio immediato dati."));
+    collectAndSendSamples(true);
+    tempTick = millis() + time_of_system_update;
+    Serial.printf("Prossima lettura tra %lu secondi\n", time_of_system_update / 1000);
+  }
 }
 
 /* ===================== STATUS BYTE (SEN55) ===================== */
@@ -275,159 +450,14 @@ void loop() {
   gnssFeed();
   if (captiveRun) server.updateDNS();
 
+  updateD7SState();
+
   if (millis() >= (unsigned long)tempTick) {
     tempTick = millis() + time_of_system_update;
     Serial.printf("Prossima lettura tra %lu secondi\n", time_of_system_update / 1000);
-
-    // WiFi & NTP
-    if (WiFi.status() != WL_CONNECTED) { WiFi.begin(); delay(4000); }
-    if (WiFi.status() == WL_CONNECTED && !flag) { timeClient.begin(); flag = 1; }
-
-    // Piccola attesa non bloccante con GNSS feed
-    for (int i = 0; i < 20; ++i) { delay(100); gnssFeed(); }
-    if (!gnssReady || (!gps.satellites.isValid() && !gps.location.isValid())) tryStartGNSS();
-
-    // --- SCD30 ---
-    float co2Concentration = NAN, SCD30temperature = NAN, SCD30humidity = NAN;
-    uint16_t dataReady = 0;
-    if (scd30.getDataReady(dataReady) == 0 && dataReady) {
-      error = scd30.blockingReadMeasurementData(co2Concentration, SCD30temperature, SCD30humidity);
-      if (error != NO_ERROR) { Serial.print("SCD30 read error: "); errorToString(error, errorMessage, sizeof errorMessage); Serial.println(errorMessage); }
-      else {
-        Serial.printf("SCD30 CO2=%.2f ppm (T=%.2fC RH=%.2f%%)\n", co2Concentration, SCD30temperature, SCD30humidity);
-      }
-    } else Serial.println("SCD30 data not ready.");
-
-    // --- SEN55 ---
-    float pm1p0=NAN, pm2p5=NAN, pm4p0=NAN, pm10p0=NAN;
-    float senT=NAN, senRH=NAN, vocIndex=NAN, noxIndex=NAN;
-    for (int i=0;i<15;++i){ delay(80); gnssFeed(); }
-    uint16_t sErr = sen5x.readMeasuredValues(pm1p0, pm2p5, pm4p0, pm10p0, senRH, senT, vocIndex, noxIndex);
-    if (sErr) { Serial.print("SEN55 read err=0x"); Serial.println(sErr, HEX); }
-    else {
-      Serial.printf("SEN55 PM1=%.2f PM2.5=%.2f PM4=%.2f PM10=%.2f VOC=%.2f NOx=%.2f (T=%.2fC RH=%.2f%%)\n",
-                    pm1p0, pm2p5, pm4p0, pm10p0, vocIndex, noxIndex, senT, senRH);
-    }
-    uint32_t sen55_status_word=0; uint8_t sen55_status_b=0;
-    uint16_t sStatErr = sen5x.readDeviceStatus(sen55_status_word);
-    if (!sStatErr) {
-      sen55_status_b = sen55StatusByte(sen55_status_word);
-      Serial.printf("SEN55 status 0x%02X | FAN=%u SPEED=%u LASER=%u RHT=%u GAS=%u CLEAN=%u\n",
-        sen55_status_b,
-        (sen55_status_b>>0)&1, (sen55_status_b>>1)&1, (sen55_status_b>>2)&1,
-        (sen55_status_b>>3)&1, (sen55_status_b>>4)&1, (sen55_status_b>>5)&1);
-    } else { Serial.print("SEN55 status read err=0x"); Serial.println(sStatErr, HEX); }
-
-    // --- BME680 ---
-    static int BME680temp=0, BME680humidity=0, BME680pressure=0, BME680gas=0;
-    if (bme680_ok) {
-      if (!BME680.performReading()) Serial.println("BME680 reading failure.");
-      else {
-        BME680temp     = (int)round(BME680.temperature    * 100.0);
-        BME680humidity = (int)round(BME680.humidity       * 100.0);
-        BME680pressure = (int)round(BME680.pressure       * 100.0);
-        BME680gas      = (int)round(BME680.gas_resistance * 100.0);
-        Serial.printf("BME680 T=%.2fC RH=%.2f%% P=%.2fPa Gas=%.2fΩ\n",
-                      BME680temp/100.0, BME680humidity/100.0, BME680pressure/100.0, BME680gas/100.0);
-      }
-    }
-
-    // --- D7S: SI / PGA / EQ con anti-stallo identico al tuo esempio ---
-    float d7s_si_raw  = D7S.getInstantaneusSI();    // [m/s]
-    float d7s_pga_raw = D7S.getInstantaneusPGA();   // [m/s^2]
-    bool  d7s_eq_raw  = D7S.isEarthquakeOccuring(); // bit “terremoto” del sensore
-    uint32_t nowMs    = millis();
-
-    bool d7s_changed = (fabsf(d7s_si_raw  - d7s_last_si)  > D7S_EPS_SI) ||
-                       (fabsf(d7s_pga_raw - d7s_last_pga) > D7S_EPS_PGA);
-
-    if (!d7s_eq_app && d7s_eq_raw && d7s_changed) {
-      d7s_eq_app = true;
-      d7s_last_change_ms = nowMs;
-    }
-
-    if (d7s_eq_app) {
-      if (d7s_changed) d7s_last_change_ms = nowMs;
-      if ((nowMs - d7s_last_change_ms) >= D7S_STALE_TIME_MS) {
-        d7s_eq_app = false;
-        D7S.resetEvents(); // reset “evento” lato sensore
-      }
-    }
-
-    float d7s_si_out  = d7s_eq_app ? d7s_si_raw  : 0.0f;
-    float d7s_pga_out = d7s_eq_app ? d7s_pga_raw : 0.0f;
-    int   d7s_eq_out  = d7s_eq_app ? 1 : 0;
-
-    // aggiorna riferimenti per il prossimo giro
-    d7s_last_si  = d7s_si_raw;
-    d7s_last_pga = d7s_pga_raw;
-
-    Serial.printf("D7S SI=%.3f m/s  PGA=%.3f m/s^2  EQ=%d\n", d7s_si_out, d7s_pga_out, d7s_eq_out);
-
-    // --- Batteria ---
-    float vbat = readBatteryVoltage();
-    int batPct = voltageToPercent(vbat);
-    int batV_x100 = (int)lroundf(vbat * 100.0f);
-    Serial.printf("BAT: %.3f V  ~ %d%%\n", vbat, batPct);
-
-    // --- Data/ora ---
-    unsigned long currentEpochTime;
-    if (WiFi.status() == WL_CONNECTED) {
-      if (timeClient.update()) { currentEpochTime = timeClient.getEpochTime(); lastEpochTime = currentEpochTime; lastMillis = millis(); }
-      else                      { currentEpochTime = lastEpochTime + ((millis() - lastMillis) / 1000); }
-    } else {
-      currentEpochTime = lastEpochTime + ((millis() - lastMillis) / 1000);
-    }
-    struct tm *ptm = gmtime((time_t *)&currentEpochTime);
-    sprintf(currentDate, "%4d/%02d/%02d", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday);
-    sprintf(currentTime, "%02d:%02d:%02d", ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
-
-    // --- GNSS: aggiorna lat/lon ---
-    updateLatLonStrings();
-
-    // ========= ORDINAMENTO COLONNE: Sheet == SD =========
-    // Intestazione attesa:
-    // data, ora, mac_address,
-    // co2_ppm,
-    // pm1, pm2_5, pm4, pm10, voc_index, nox_index,
-    // sen55_fan_err, sen55_speed_warn, sen55_laser_err, sen55_rht_err, sen55_gas_err, sen55_cleaning,
-    // bme_temp_c_x100, bme_rh_x100, bme_pressure_pa_x100, bme_gas_ohm_x100,
-    // d7s_si_mps, d7s_pga_mps2, d7s_eq_bit,
-    // bat_mV_x100, bat_pct,
-    // latitude, longitude
-
-    String macStr = String(WiFi.macAddress());
-
-    // ===== SD =====
-    writeDataOnSD(
-      String(currentDate), String(currentTime), macStr,
-      String(co2Concentration, 2),
-      String(pm1p0), String(pm2p5), String(pm4p0), String(pm10p0),
-      String(vocIndex), String(noxIndex),
-      String((sen55_status_b>>0)&1), String((sen55_status_b>>1)&1), String((sen55_status_b>>2)&1),
-      String((sen55_status_b>>3)&1), String((sen55_status_b>>4)&1), String((sen55_status_b>>5)&1),
-      String(BME680temp), String(BME680humidity), String(BME680pressure), String(BME680gas),
-      String(d7s_si_out, 3), String(d7s_pga_out, 3), String(d7s_eq_out),
-      String(batV_x100), String(batPct),
-      String(latitude), String(longitude)
-    );
-
-    // ===== Google Sheet =====
-    if (WiFi.status() == WL_CONNECTED) {
-      sendDataToGoogle(
-        String(currentDate), String(currentTime), macStr,
-        String(co2Concentration, 2),
-        String(pm1p0), String(pm2p5), String(pm4p0), String(pm10p0),
-        String(vocIndex), String(noxIndex),
-        String((sen55_status_b>>0)&1), String((sen55_status_b>>1)&1), String((sen55_status_b>>2)&1),
-        String((sen55_status_b>>3)&1), String((sen55_status_b>>4)&1), String((sen55_status_b>>5)&1),
-        String(BME680temp), String(BME680humidity), String(BME680pressure), String(BME680gas),
-        String(d7s_si_out, 3), String(d7s_pga_out, 3), String(d7s_eq_out),
-        String(batV_x100), String(batPct),
-        String(latitude), String(longitude)
-      );
-    }
+    collectAndSendSamples(false);
   }
 
   gnssFeed();
 }
+
