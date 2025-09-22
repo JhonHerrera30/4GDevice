@@ -36,7 +36,7 @@ String longitude;
 // ======= D7S (Grove) =======
 #include <D7S.h>
 // Logica anti-stallo (come nel tuo esempio)
-static const uint32_t D7S_STALE_TIME_MS = 3000;
+static const uint32_t D7S_STALE_TIME_MS = 40000;
 static const float    D7S_EPS_SI        = 0.002f;  // m/s
 static const float    D7S_EPS_PGA       = 0.020f;  // m/s^2
 // Stato anti-stallo
