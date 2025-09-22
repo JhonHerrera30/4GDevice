@@ -36,12 +36,14 @@ String longitude;
 // ======= D7S (Grove) =======
 #include <D7S.h>
 // Logica anti-stallo (come nel tuo esempio)
-static const uint32_t D7S_STALE_TIME_MS = 40000;
-static const float    D7S_EPS_SI        = 0.002f;  // m/s
-static const float    D7S_EPS_PGA       = 0.020f;  // m/s^2
+static const uint32_t D7S_STALE_TIME_MS       = 40000;
+static const uint32_t D7S_EQ_SEND_INTERVAL_MS = 5000;
+static const float    D7S_EPS_SI              = 0.002f;  // m/s
+static const float    D7S_EPS_PGA             = 0.020f;  // m/s^2
 // Stato anti-stallo
 static bool     d7s_eq_app         = false;
 static uint32_t d7s_last_change_ms = 0;
+static uint32_t d7s_last_send_ms   = 0;
 static float    d7s_last_si        = 0.0f;
 static float    d7s_last_pga       = 0.0f;
 static float    d7s_si_out         = 0.0f;
@@ -335,12 +337,27 @@ static void updateD7SState() {
   if (!prev_eq_app && d7s_eq_app) {
     Serial.println(F("[D7S] Terremoto rilevato: invio immediato dati."));
     collectAndSendSamples(true);
+    d7s_last_send_ms = millis();
     time_of_system_update = 0;
     tempTick = 0;
     Serial.println(F("[D7S] Invio periodico sospeso durante l'evento."));
   }
 
+  if (d7s_eq_app && prev_eq_app) {
+    uint32_t nowSendMs = millis();
+    if ((nowSendMs - d7s_last_send_ms) >= D7S_EQ_SEND_INTERVAL_MS) {
+      Serial.println(F("[D7S] Evento in corso: invio periodico dei dati sismici."));
+      collectAndSendSamples(true);
+      d7s_last_send_ms = millis();
+    }
+    if (time_of_system_update != 0) {
+      time_of_system_update = 0;
+      tempTick = 0;
+    }
+  }
+
   if (prev_eq_app && !d7s_eq_app) {
+    d7s_last_send_ms = 0;
     Serial.println(F("[D7S] Evento sismico concluso: ripristino invio periodico."));
     time_of_system_update = default_time_of_system_update;
     if (time_of_system_update > 0) {
