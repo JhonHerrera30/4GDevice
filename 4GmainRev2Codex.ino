@@ -11,6 +11,7 @@
 #include <SPI.h>
 
 unsigned int time_of_system_update;
+static unsigned int default_time_of_system_update = 0;
 unsigned long lastEpochTime = 0;
 unsigned long lastMillis = 0;
 String latitude;
@@ -329,8 +330,21 @@ static void updateD7SState() {
   if (!prev_eq_app && d7s_eq_app) {
     Serial.println(F("[D7S] Terremoto rilevato: invio immediato dati."));
     collectAndSendSamples(true);
-    tempTick = millis() + time_of_system_update;
-    Serial.printf("Prossima lettura tra %lu secondi\n", time_of_system_update / 1000);
+    time_of_system_update = 0;
+    tempTick = 0;
+    Serial.println(F("[D7S] Invio periodico sospeso durante l'evento."));
+  }
+
+  if (prev_eq_app && !d7s_eq_app) {
+    Serial.println(F("[D7S] Evento sismico concluso: ripristino invio periodico."));
+    time_of_system_update = default_time_of_system_update;
+    if (time_of_system_update > 0) {
+      tempTick = millis() + time_of_system_update;
+      Serial.printf("Prossima lettura tra %lu secondi\n", time_of_system_update / 1000);
+    } else {
+      tempTick = 0;
+      Serial.println(F("[D7S] Periodo predefinito nullo: invio periodico disabilitato."));
+    }
   }
 }
 
@@ -368,6 +382,7 @@ void setup() {
 
   // Webserver (carica config + eventuale cache GNSS)
   startWebserver();
+  default_time_of_system_update = time_of_system_update;
 
   tempTick = 0;
 
@@ -452,7 +467,7 @@ void loop() {
 
   updateD7SState();
 
-  if (millis() >= (unsigned long)tempTick) {
+  if (time_of_system_update > 0 && millis() >= (unsigned long)tempTick) {
     tempTick = millis() + time_of_system_update;
     Serial.printf("Prossima lettura tra %lu secondi\n", time_of_system_update / 1000);
     collectAndSendSamples(false);
